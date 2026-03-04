@@ -134,10 +134,11 @@ export async function publishCKBFS({
   await tx.completeFeeBy(signer, 1000n);
 
   // ── 7. Derive TypeID ──────────────────────────────────────────────────────
-  if (!tx.inputs[0]?.previousOutput) {
+  if (!tx.inputs[0]) {
     throw new Error('No inputs collected — wallet may have insufficient CKB (need 225+ CKB for CKBFS index cell)');
   }
-  const typeId = ccc.hashTypeId(tx.inputs[0].previousOutput, 0);
+  // hashTypeId takes the full CellInput object, NOT just previousOutput
+  const typeId = ccc.hashTypeId(tx.inputs[0], 0);
   tx.outputs[0].type.args = typeId;
 
   log(70, `TypeID: ${typeId.slice(0, 18)}…`);
