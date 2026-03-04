@@ -227,15 +227,11 @@ export async function publishCKBFS({
   log(40, 'Collecting inputs…');
   await preTx.completeInputsByCapacity(signer);
 
-  // ── 9. Fee + change ───────────────────────────────────────────────────────
-  log(55, 'Computing fee (without witnesses)…');
-  await preTx.completeFeeChangeToLock(signer, lock, 2000);
-
-  // ── 10. TypeID = hash(input[0], outputIndex=0) ───────────────────────────
+  // ── 9. TypeID = hash(input[0], outputIndex=0) — do this before fee so TypeID is stable
   const typeIdArgs = ccc.hashTypeId(preTx.inputs[0], 0);
 
-  // ── Now set witnesses and rebuild outputData with correct start index ───────
-  const witnessStartIndex = preTx.inputs.length; // e.g. 1 or 2 inputs
+  // ── 10. Set witnesses and rebuild outputData with correct start index ──────
+  const witnessStartIndex = preTx.inputs.length; // e.g. 1 input → CKBFS starts at index 1
   const ckbfsWitnesses = buildWitnesses(witnessStartIndex);
   const finalOutputData = buildOutputData(witnessStartIndex);
 
@@ -245,6 +241,10 @@ export async function publishCKBFS({
   ];
   preTx.outputsData[0] = ccc.hexFrom(finalOutputData);
   log(60, `Witnesses set: startIndex=${witnessStartIndex}, ${ckbfsWitnesses.length} CKBFS chunks`);
+
+  // ── 11. Fee + change — AFTER witnesses so tx size includes full witness data ──
+  log(65, 'Computing fee (with witnesses included)…');
+  await preTx.completeFeeChangeToLock(signer, lock, 2000, undefined, { shouldAddInputs: false });
   const finalTypeScript = ccc.Script.from({
     codeHash: contract.codeHash,
     hashType:  'data1',
