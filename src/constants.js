@@ -38,12 +38,12 @@ export const CONTRACT = {
   mainnet: {
     txHash:  '0xfab07962ed7178ed88d450774e2a6ecd50bae856bdb9b692980be8c5147d1bfa',
     index:   '0x0',
-    depType: 'dep_group',
+    depType: 'depGroup',  // CCC uses camelCase — 'dep_group' encodes as 0x00 (wrong), 'depGroup' = 0x01
   },
   testnet: {
     txHash:  '0x469af0d961dcaaedd872968a9388b546717a6ccfa47b3165b3f9c981e9d66aaa',
     index:   '0x0',
-    depType: 'dep_group',
+    depType: 'depGroup',
   },
 };
 
