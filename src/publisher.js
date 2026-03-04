@@ -83,7 +83,7 @@ export async function publishCKBFS({
     filename:    filename    || 'file',
   });
 
-  log(10, 'Encoded metadata…');
+  log(10, `Encoded metadata — outputData.length=${outputData.length} bytes, content.length=${content.length} bytes`);
 
   // ── 3. Get signer lock script ──────────────────────────────────────────────
   // getAddressObjs() returns Address objects with .script — unlike getAddresses() which returns strings
@@ -110,10 +110,13 @@ export async function publishCKBFS({
       // Output[0]: CKBFS index cell — TypeID filled after input collection
       {
         // Compute exact capacity from actual output data size + lock args length
-        capacity: ccc.numToHex(computeIndexCellCapacity(
-          ccc.hexFrom(outputData),
-          lockScript.args ? (lockScript.args.length - 2) / 2 : 20,
-        )),
+        capacity: (() => {
+          const hexData = ccc.hexFrom(outputData);
+          const lockArgs = lockScript.args ? (lockScript.args.length - 2) / 2 : 20;
+          const cap = computeIndexCellCapacity(hexData, lockArgs);
+          log(16, `[DBG] outputData=${outputData.length}B hexData=${hexData.length}chars lockArgs=${lockArgs}B cap=${Number(cap)/1e8}CKB`);
+          return ccc.numToHex(cap);
+        })(),
         lock: lockScript,
         type: {
           codeHash: CKBFS_CODE_HASH,
