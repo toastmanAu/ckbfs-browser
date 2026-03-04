@@ -18,6 +18,20 @@ import { encodeCKBFSData, encodeCKBFSWitness } from './molecule.js';
 const BYTES_PER_SHANNON = 100_000_000n;
 
 /**
+ * Compute the minimum cell capacity for a CKBFS index cell (in shannons).
+ * capacity(8) + lock(32+1+lockArgs) + type(32+1+32) + data(dataBytes)
+ * Add 2 CKB headroom to ensure CCC's completeFeeBy doesn't need extra inputs.
+ */
+function computeIndexCellCapacity(outputData, lockArgsBytes = 20) {
+  const lockSize = 32 + 1 + lockArgsBytes; // code_hash + hash_type + args
+  const typeSize = 32 + 1 + 32;            // code_hash + hash_type + TypeID args
+  const dataLen  = Math.ceil(outputData.length / 2); // hex string → bytes
+  const minBytes = 8 + lockSize + typeSize + dataLen;
+  const headroom = 200000000n; // 2 CKB headroom
+  return BigInt(minBytes) * 100000000n + headroom;
+}
+
+/**
  * Publish a file to CKBFS V2 using any CCC signer.
  *
  * @param {object}   opts
@@ -95,7 +109,11 @@ export async function publishCKBFS({
     outputs: [
       // Output[0]: CKBFS index cell — TypeID filled after input collection
       {
-        capacity: ccc.numToHex(CKBFS_CELL_CAPACITY),
+        // Compute exact capacity from actual output data size + lock args length
+        capacity: ccc.numToHex(computeIndexCellCapacity(
+          ccc.hexFrom(outputData),
+          lockScript.args ? (lockScript.args.length - 2) / 2 : 20,
+        )),
         lock: lockScript,
         type: {
           codeHash: CKBFS_CODE_HASH,
@@ -164,7 +182,7 @@ export async function publishCKBFS({
     txHash,
     typeId,
     uri:         `ckbfs://${typeId}`,
-    capacityCkb: Number(CKBFS_CELL_CAPACITY / BYTES_PER_SHANNON),
+    capacityCkb: Number(computeIndexCellCapacity(ccc.hexFrom(outputData), lockScript.args ? (lockScript.args.length - 2) / 2 : 20) / BYTES_PER_SHANNON),
   };
 }
 
@@ -175,7 +193,7 @@ export function estimateCKBFSCost(contentBytes) {
     txFeeCkb:     parseFloat((0.01 + chunks * 0.001).toFixed(4)),
     totalCkb:     Number(CKBFS_CELL_CAPACITY / 100_000_000n) + parseFloat((0.01 + chunks * 0.001).toFixed(4)),
     chunks,
-    note: 'Index cell (225 CKB) locked permanently. File bytes in prunable witnesses.',
+    note: 'Index cell capacity locked permanently (size varies ~150–225 CKB based on file metadata). File bytes in prunable witnesses.',
   };
 }
 
