@@ -131,12 +131,8 @@ export async function publishCKBFS({
   log(50, 'Collecting inputs…');
   await tx.addCellDepsOfKnownScripts(signer.client);
   const witnessFeeReserve = BigInt(chunks.length) * 100000n;
-  log(51, `[DBG] outputs capacity: ${tx.getOutputsCapacity()} shannons, fee reserve: ${witnessFeeReserve}`);
   await tx.completeInputsByCapacity(signer, witnessFeeReserve);
-  log(52, `[DBG] inputs collected: ${tx.inputs.length}, inputs capacity: ${await tx.getInputsCapacity(signer.client)} shannons`);
-  log(53, `[DBG] outputs[1] before fee: ${tx.outputs[1]?.capacity}`);
   await tx.completeFeeBy(signer, 3000n);
-  log(54, `[DBG] fee complete — inputs: ${tx.inputs.length}, change: ${tx.outputs[1]?.capacity} shannons`);
 
   // ── 7. Derive TypeID ──────────────────────────────────────────────────────
   if (!tx.inputs[0]) {
