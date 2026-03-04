@@ -71,9 +71,14 @@ export async function publishCKBFS({
 
   log(10, 'Encoded metadata…');
 
-  // ── 3. Get signer address for change output ────────────────────────────────
-  const addresses = await signer.getAddresses();
-  const changeAddr = addresses[0];
+  // ── 3. Get signer address + lock script ───────────────────────────────────
+  const addrStrings = await signer.getAddresses();
+  const addrStr = addrStrings[0];
+  if (!addrStr) throw new Error('publishCKBFS: signer returned no addresses');
+
+  // Parse address string → Address object to get the lock script
+  const changeAddr = await ccc.Address.fromString(addrStr, signer.client);
+  const lockScript = changeAddr.script;
 
   // ── 4. Build CCC transaction ───────────────────────────────────────────────
   log(15, 'Building transaction…');
@@ -95,7 +100,7 @@ export async function publishCKBFS({
       // Output[0]: CKBFS index cell — TypeID filled after input collection
       {
         capacity: ccc.numToHex(CKBFS_CELL_CAPACITY),
-        lock: changeAddr.script,
+        lock: lockScript,
         type: {
           codeHash: CKBFS_CODE_HASH,
           hashType: 'data1',
@@ -105,7 +110,7 @@ export async function publishCKBFS({
       // Output[1]: change
       {
         capacity: '0x0',
-        lock: changeAddr.script,
+        lock: lockScript,
         type: null,
       },
     ],
