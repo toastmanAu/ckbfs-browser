@@ -146,37 +146,45 @@ export async function publishCKBFS({
   const lock = addrObj.script;
   log(15, 'Got lock script');
 
-  // ── 4. Encode V3 cell data (index=1, checksum, contentType, filename) ─────
-  // Witnesses: [0]=lock witness, [1]=head ckbfs witness, [2+]=continuation
-  const witnessStartIndex = 1;
-  const outputData = encodeCKBFSDataV3({
-    index:       witnessStartIndex,
-    checksum,
-    contentType: contentType || 'application/octet-stream',
-    filename:    filename || 'file',
-  });
-  log(18, `Cell data: ${outputData.length} bytes`);
+  // ── 4. Compute witness start index and encode cell data ──────────────────
+  // witnessStartIndex = number of inputs (each gets one '0x' lock witness slot)
+  // We don't know input count yet — use placeholder, recompute after input collection
+  // For cell data encoding: use placeholder index 1 (will rebuild after inputs known)
+  // CKBFS witnesses encoded separately, re-indexed after inputs collected
+  log(18, 'Chunks ready, witnesses will be encoded after input collection…');
 
-  // ── 5. Encode V3 witnesses ────────────────────────────────────────────────
-  const ckbfsWitnesses = chunks.map((chunk, i) => {
-    const isHead = i === 0;
-    const isTail = i === chunks.length - 1;
-    if (isHead) {
-      return encodeHeadWitness({
-        prevTxHash:       '0x' + '00'.repeat(32),
-        prevWitnessIndex: 0,
-        prevChecksum:     0,
-        nextIndex:        isTail ? 0 : witnessStartIndex + i + 1,
-        content:          chunk,
-      });
-    } else {
-      return encodeContinuationWitness({
-        nextIndex: isTail ? 0 : witnessStartIndex + i + 1,
-        content:   chunk,
-      });
-    }
-  });
-  log(20, 'Witnesses encoded');
+  // ── 5. Encode CKBFS witnesses (indices computed after input collection) ─────
+  // We encode with placeholder indices first, then rebuild with correct ones after inputs known.
+  // The head witness nextIndex is relative — we'll recompute after knowing input count.
+  function buildWitnesses(startIndex) {
+    return chunks.map((chunk, i) => {
+      const isHead = i === 0;
+      const isTail = i === chunks.length - 1;
+      if (isHead) {
+        return encodeHeadWitness({
+          prevTxHash:       '0x' + '00'.repeat(32),
+          prevWitnessIndex: 0,
+          prevChecksum:     0,
+          nextIndex:        isTail ? 0 : startIndex + i + 1,
+          content:          chunk,
+        });
+      } else {
+        return encodeContinuationWitness({
+          nextIndex: isTail ? 0 : startIndex + i + 1,
+          content:   chunk,
+        });
+      }
+    });
+  }
+
+  function buildOutputData(startIndex) {
+    return encodeCKBFSDataV3({
+      index:       startIndex,
+      checksum,
+      contentType: contentType || 'application/octet-stream',
+      filename:    filename || 'file',
+    });
+  }
 
   // ── 6. Pre-type script (zeroed args for capacity calc) ────────────────────
   const preTypeScript = ccc.Script.from({
@@ -186,17 +194,17 @@ export async function publishCKBFS({
   });
 
   // Cell capacity = (8 + lock.occupiedSize + type.occupiedSize + outputData.length) * 1e8
-  const _lockOcc  = lock.occupiedSize;
-  const _typeOcc  = preTypeScript.occupiedSize;
-  const _dataLen  = outputData.length;
-  const _contentLen = content.length;
-  log(21, `[DBG] lock.occupiedSize=${_lockOcc} type.occupiedSize=${_typeOcc} outputData.length=${_dataLen} content.length=${_contentLen}`);
-  const cellBytes = BigInt(8 + _lockOcc + _typeOcc + _dataLen);
+  // Use placeholder startIndex=1 for capacity estimate — close enough (1 CKB diff max)
+  const _placeholderData = buildOutputData(1);
+  const cellBytes = BigInt(8 + lock.occupiedSize + preTypeScript.occupiedSize + _placeholderData.length);
   const cellCapacity = cellBytes * BYTES_PER_SHANNON;
-  log(22, `[DBG2] cellBytes=${cellBytes} cellCapacity=${cellCapacity} (${Number(cellCapacity)/1e8} CKB)`);
+  log(22, `Cell capacity: ${Number(cellCapacity)/1e8} CKB (${cellBytes} bytes)`);
   log(22, `Cell capacity: ${Number(cellCapacity) / 1e8} CKB`);
 
-  // ── 7. Build initial transaction (no inputs yet) ──────────────────────────
+  // ── 7. Build initial transaction — NO witnesses yet (added after input collection) ──
+  // CRITICAL: witnesses must be added AFTER completeInputsByCapacity, because
+  // CCC's addInput() inserts '0x' placeholders at inputs.length when witnesses.length > inputs.length,
+  // which would push our CKBFS witnesses to wrong indices.
   log(25, 'Building transaction…');
   const preTx = ccc.Transaction.from({
     version: '0x0',
@@ -211,11 +219,8 @@ export async function publishCKBFS({
       lock,
       type: preTypeScript,
     }],
-    outputsData: [ccc.hexFrom(outputData)],
-    witnesses: [
-      '0x', // slot 0 = lock witness (CCC fills on sign)
-      ...ckbfsWitnesses.map(w => ccc.hexFrom(w)),
-    ],
+    outputsData: [ccc.hexFrom(_placeholderData)],
+    witnesses: [], // empty — filled after inputs collected
   });
 
   // ── 8. Collect inputs ─────────────────────────────────────────────────────
@@ -223,11 +228,23 @@ export async function publishCKBFS({
   await preTx.completeInputsByCapacity(signer);
 
   // ── 9. Fee + change ───────────────────────────────────────────────────────
-  log(55, 'Computing fee…');
+  log(55, 'Computing fee (without witnesses)…');
   await preTx.completeFeeChangeToLock(signer, lock, 2000);
 
   // ── 10. TypeID = hash(input[0], outputIndex=0) ───────────────────────────
   const typeIdArgs = ccc.hashTypeId(preTx.inputs[0], 0);
+
+  // ── Now set witnesses and rebuild outputData with correct start index ───────
+  const witnessStartIndex = preTx.inputs.length; // e.g. 1 or 2 inputs
+  const ckbfsWitnesses = buildWitnesses(witnessStartIndex);
+  const finalOutputData = buildOutputData(witnessStartIndex);
+
+  preTx.witnesses = [
+    ...Array.from({ length: preTx.inputs.length }, () => '0x'), // one slot per input
+    ...ckbfsWitnesses.map(w => ccc.hexFrom(w)),
+  ];
+  preTx.outputsData[0] = ccc.hexFrom(finalOutputData);
+  log(60, `Witnesses set: startIndex=${witnessStartIndex}, ${ckbfsWitnesses.length} CKBFS chunks`);
   const finalTypeScript = ccc.Script.from({
     codeHash: contract.codeHash,
     hashType:  'data1',
