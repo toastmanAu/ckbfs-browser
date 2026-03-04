@@ -130,8 +130,12 @@ export async function publishCKBFS({
   // ── 6. Collect inputs + fees ───────────────────────────────────────────────
   log(50, 'Collecting inputs…');
   await tx.addCellDepsOfKnownScripts(signer.client);
-  await tx.completeInputsByCapacity(signer);
-  await tx.completeFeeBy(signer, 1000n);
+  // Pre-reserve ~500K shannons (0.005 CKB) for witness fees before collecting inputs.
+  // CKBFS witnesses can be 30KB+ per chunk — at 3000 shannons/KB that's 90K+ per chunk.
+  // Without this, completeFeeBy may fail because change is already at minimum.
+  const witnessFeeReserve = BigInt(chunks.length) * 100000n; // ~0.001 CKB per chunk
+  await tx.completeInputsByCapacity(signer, witnessFeeReserve);
+  await tx.completeFeeBy(signer, 3000n); // 3000 shannons/KB
 
   // ── 7. Derive TypeID ──────────────────────────────────────────────────────
   if (!tx.inputs[0]) {
