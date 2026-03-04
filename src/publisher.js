@@ -186,8 +186,14 @@ export async function publishCKBFS({
   });
 
   // Cell capacity = (8 + lock.occupiedSize + type.occupiedSize + outputData.length) * 1e8
-  const cellBytes = BigInt(8 + lock.occupiedSize + preTypeScript.occupiedSize + outputData.length);
+  const _lockOcc  = lock.occupiedSize;
+  const _typeOcc  = preTypeScript.occupiedSize;
+  const _dataLen  = outputData.length;
+  const _contentLen = content.length;
+  log(21, `[DBG] lock.occupiedSize=${_lockOcc} type.occupiedSize=${_typeOcc} outputData.length=${_dataLen} content.length=${_contentLen}`);
+  const cellBytes = BigInt(8 + _lockOcc + _typeOcc + _dataLen);
   const cellCapacity = cellBytes * BYTES_PER_SHANNON;
+  log(22, `[DBG2] cellBytes=${cellBytes} cellCapacity=${cellCapacity} (${Number(cellCapacity)/1e8} CKB)`);
   log(22, `Cell capacity: ${Number(cellCapacity) / 1e8} CKB`);
 
   // ── 7. Build initial transaction (no inputs yet) ──────────────────────────
