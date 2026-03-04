@@ -1,0 +1,23 @@
+{
+  "name": "@wyltek/ckbfs-browser",
+  "version": "0.1.0",
+  "description": "Browser-native CKBFS V2 publisher — publish files to CKB using any CCC signer (JoyID, MetaMask, hardware wallet). Zero server. Zero Node.js dependencies.",
+  "type": "module",
+  "main": "./src/index.js",
+  "module": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": ["src", "README.md", "LICENSE"],
+  "keywords": ["ckb", "ckbfs", "spore", "dob", "browser", "joyid", "ccc", "on-chain-storage"],
+  "author": "Wyltek Industries",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/toastmanAu/ckbfs-browser"
+  },
+  "peerDependencies": {
+    "@ckb-ccc/core": ">=1.0.0"
+  },
+  "devDependencies": {}
+}
