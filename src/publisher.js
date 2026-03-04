@@ -1,14 +1,101 @@
 /**
- * publisher.js — CKBFS V3 publisher using the official @ckbfs/api SDK
+ * publisher.js — Browser-native CKBFS V3 transaction builder
  *
- * Delegates to @ckbfs/api's createPublishV3Transaction for correct tx construction.
- * The host app must have @ckbfs/api installed as a peer dependency.
+ * Pure implementation using only @ckb-ccc/core (1.x) — no @ckbfs/api dependency.
+ * Avoids the dual-CCC-version conflict that causes "superclass is not a constructor".
+ *
+ * Protocol: CKBFS V3 (20250821.4ee6689bf7ec)
+ * Witness format: head = CKBFS(5) + ver(1) + prevTxHash(32) + prevWitnessIdx(4) + prevChecksum(4) + nextIdx(4) + content
+ *                 continuation = nextIdx(4) + content
+ * Cell data: molecule table { index: Uint32, checksum: Uint32, contentType: Bytes, filename: Bytes }
  */
 
-import { CHUNK_SIZE } from './constants.js';
+import { CHUNK_SIZE, CONTRACT_V3 } from './constants.js';
 
 const BYTES_PER_SHANNON = 100_000_000n;
+const CKBFS_HEADER = new Uint8Array([0x43, 0x4b, 0x42, 0x46, 0x53]); // "CKBFS"
 
+// ── Adler32 checksum (pure JS, no deps) ───────────────────────────────────────
+function adler32(data) {
+  const MOD = 65521;
+  let a = 1, b = 0;
+  for (let i = 0; i < data.length; i++) {
+    a = (a + data[i]) % MOD;
+    b = (b + a) % MOD;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+// ── Molecule encoding for V3 cell data ────────────────────────────────────────
+// Table layout: 4-byte total-len + 4 offsets (4 bytes each) + field bytes
+function u32le(n) {
+  const b = new Uint8Array(4);
+  new DataView(b.buffer).setUint32(0, n >>> 0, true);
+  return b;
+}
+function moleculeBytes(s) {
+  const enc = new TextEncoder().encode(s);
+  return concat([u32le(enc.length), enc]);
+}
+function concat(arrays) {
+  const total = arrays.reduce((n, a) => n + a.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const a of arrays) { out.set(a, off); off += a.length; }
+  return out;
+}
+
+/**
+ * Encode V3 CKBFSData molecule table:
+ * { index: Uint32, checksum: Uint32, contentType: Bytes, filename: Bytes }
+ */
+function encodeCKBFSDataV3({ index, checksum, contentType, filename }) {
+  const fieldIndex    = u32le(index);
+  const fieldChecksum = u32le(checksum);
+  const fieldCT       = moleculeBytes(contentType);
+  const fieldFN       = moleculeBytes(filename);
+
+  const HEADER_SIZE = 4; // total-len u32
+  const OFFSET_SIZE = 4; // per-field offset u32
+  const NUM_FIELDS  = 4;
+  const headerBytes = HEADER_SIZE + NUM_FIELDS * OFFSET_SIZE; // 20
+
+  const fields = [fieldIndex, fieldChecksum, fieldCT, fieldFN];
+  let offset = headerBytes;
+  const offsets = fields.map(f => { const o = offset; offset += f.length; return o; });
+  const totalLen = offset;
+
+  const out = new Uint8Array(totalLen);
+  const dv  = new DataView(out.buffer);
+  dv.setUint32(0, totalLen, true);
+  offsets.forEach((o, i) => dv.setUint32(4 + i * 4, o, true));
+  let pos = headerBytes;
+  for (const f of fields) { out.set(f, pos); pos += f.length; }
+  return out;
+}
+
+// ── V3 witness encoding ───────────────────────────────────────────────────────
+function encodeHeadWitness({ prevTxHash, prevWitnessIndex, prevChecksum, nextIndex, content }) {
+  const prevTxHashBytes = new Uint8Array(32);
+  if (prevTxHash && prevTxHash !== '0x' + '00'.repeat(32)) {
+    const h = prevTxHash.startsWith('0x') ? prevTxHash.slice(2) : prevTxHash;
+    for (let i = 0; i < 32; i++) prevTxHashBytes[i] = parseInt(h.substr(i * 2, 2), 16);
+  }
+  const buf = new ArrayBuffer(4);
+  const dv  = new DataView(buf);
+  const prevWitBuf      = new Uint8Array(4); dv.setUint32(0, prevWitnessIndex || 0, true); prevWitBuf.set(new Uint8Array(buf));
+  const prevChecksumBuf = new Uint8Array(4); dv.setUint32(0, prevChecksum    || 0, true); prevChecksumBuf.set(new Uint8Array(buf));
+  const nextIdxBuf      = new Uint8Array(4); dv.setUint32(0, nextIndex        || 0, true); nextIdxBuf.set(new Uint8Array(buf));
+  return concat([CKBFS_HEADER, new Uint8Array([0x03]), prevTxHashBytes, prevWitBuf, prevChecksumBuf, nextIdxBuf, content]);
+}
+
+function encodeContinuationWitness({ nextIndex, content }) {
+  const nextIdxBuf = new Uint8Array(4);
+  new DataView(nextIdxBuf.buffer).setUint32(0, nextIndex || 0, true);
+  return concat([nextIdxBuf, content]);
+}
+
+// ── Main publish function ─────────────────────────────────────────────────────
 /**
  * Publish a file to CKBFS V3.
  *
@@ -18,7 +105,6 @@ const BYTES_PER_SHANNON = 100_000_000n;
  * @param {string}      opts.filename      - Filename for the CKBFS cell
  * @param {object}      opts.signer        - CCC signer (JoyID, MetaMask, etc.)
  * @param {object}      opts.ccc           - import * as ccc from '@ckb-ccc/core'
- * @param {object}      opts.ckbfs         - import * as ckbfs from '@ckbfs/api'
  * @param {boolean}     opts.mainnet       - true = CKB mainnet, false = testnet
  * @param {Function}    opts.onProgress    - (pct: number, msg: string) => void
  *
@@ -30,83 +116,155 @@ export async function publishCKBFS({
   filename,
   signer,
   ccc,
-  ckbfs,
   mainnet = false,
   onProgress = () => {},
 }) {
   if (!signer) throw new Error('publishCKBFS: signer is required');
   if (!ccc)    throw new Error('publishCKBFS: ccc module is required');
-  if (!ckbfs)  throw new Error('publishCKBFS: ckbfs module is required — pass import * as ckbfs from "@ckbfs/api"');
   if (!(content instanceof Uint8Array)) throw new Error('publishCKBFS: content must be Uint8Array');
 
   const network = mainnet ? 'mainnet' : 'testnet';
   const log = (pct, msg) => { onProgress(pct, msg); console.log(`[ckbfs] ${msg}`); };
+  const contract = CONTRACT_V3[network];
 
   log(0, `Preparing ${filename || 'file'} (${(content.length / 1024).toFixed(1)} KB) for CKBFS V3…`);
 
-  // ── 1. Split into chunks ───────────────────────────────────────────────────
-  const contentChunks = [];
+  // ── 1. Split into chunks ──────────────────────────────────────────────────
+  const chunks = [];
   for (let i = 0; i < content.length; i += CHUNK_SIZE) {
-    contentChunks.push(content.slice(i, i + CHUNK_SIZE));
+    chunks.push(content.slice(i, i + CHUNK_SIZE));
   }
-  if (contentChunks.length === 0) contentChunks.push(new Uint8Array(0));
+  if (chunks.length === 0) chunks.push(new Uint8Array(0));
+  log(5, `Split into ${chunks.length} chunk${chunks.length > 1 ? 's' : ''}`);
 
-  log(5, `Split into ${contentChunks.length} chunk${contentChunks.length > 1 ? 's' : ''}`);
+  // ── 2. Adler32 checksum over full content ──────────────────────────────────
+  const checksum = adler32(content);
+  log(10, `Checksum: 0x${checksum.toString(16)}`);
 
-  // ── 2. Get signer lock script ──────────────────────────────────────────────
+  // ── 3. Get lock script ────────────────────────────────────────────────────
   const addrObj = await signer.getRecommendedAddressObj();
   const lock = addrObj.script;
+  log(15, 'Got lock script');
 
-  log(15, 'Building V3 transaction via @ckbfs/api…');
-
-  // ── 3. Build tx using official SDK ────────────────────────────────────────
-  const tx = await ckbfs.createPublishV3Transaction(signer, {
-    contentChunks,
+  // ── 4. Encode V3 cell data (index=1, checksum, contentType, filename) ─────
+  // Witnesses: [0]=lock witness, [1]=head ckbfs witness, [2+]=continuation
+  const witnessStartIndex = 1;
+  const outputData = encodeCKBFSDataV3({
+    index:       witnessStartIndex,
+    checksum,
     contentType: contentType || 'application/octet-stream',
-    filename: filename || 'file',
-    lock,
-    network,
-    useTypeID: false,
-    feeRate: 2000,
+    filename:    filename || 'file',
+  });
+  log(18, `Cell data: ${outputData.length} bytes`);
+
+  // ── 5. Encode V3 witnesses ────────────────────────────────────────────────
+  const ckbfsWitnesses = chunks.map((chunk, i) => {
+    const isHead = i === 0;
+    const isTail = i === chunks.length - 1;
+    if (isHead) {
+      return encodeHeadWitness({
+        prevTxHash:       '0x' + '00'.repeat(32),
+        prevWitnessIndex: 0,
+        prevChecksum:     0,
+        nextIndex:        isTail ? 0 : witnessStartIndex + i + 1,
+        content:          chunk,
+      });
+    } else {
+      return encodeContinuationWitness({
+        nextIndex: isTail ? 0 : witnessStartIndex + i + 1,
+        content:   chunk,
+      });
+    }
+  });
+  log(20, 'Witnesses encoded');
+
+  // ── 6. Pre-type script (zeroed args for capacity calc) ────────────────────
+  const preTypeScript = ccc.Script.from({
+    codeHash: contract.codeHash,
+    hashType:  'data1',
+    args:      '0x' + '00'.repeat(32),
   });
 
-  log(85, 'Transaction built — sending to JoyID for signature…');
+  // Cell capacity = (8 + lock.occupiedSize + type.occupiedSize + outputData.length) * 1e8
+  const cellBytes = BigInt(8 + lock.occupiedSize + preTypeScript.occupiedSize + outputData.length);
+  const cellCapacity = cellBytes * BYTES_PER_SHANNON;
+  log(22, `Cell capacity: ${Number(cellCapacity) / 1e8} CKB`);
 
-  // ── 4. Sign + send ────────────────────────────────────────────────────────
+  // ── 7. Build initial transaction (no inputs yet) ──────────────────────────
+  log(25, 'Building transaction…');
+  const preTx = ccc.Transaction.from({
+    version: '0x0',
+    cellDeps: [{
+      outPoint: { txHash: contract.txHash, index: contract.index },
+      depType: contract.depType,
+    }],
+    headerDeps: [],
+    inputs: [],
+    outputs: [{
+      capacity: ccc.numToHex(cellCapacity),
+      lock,
+      type: preTypeScript,
+    }],
+    outputsData: [ccc.hexFrom(outputData)],
+    witnesses: [
+      '0x', // slot 0 = lock witness (CCC fills on sign)
+      ...ckbfsWitnesses.map(w => ccc.hexFrom(w)),
+    ],
+  });
+
+  // ── 8. Collect inputs ─────────────────────────────────────────────────────
+  log(40, 'Collecting inputs…');
+  await preTx.completeInputsByCapacity(signer);
+
+  // ── 9. Fee + change ───────────────────────────────────────────────────────
+  log(55, 'Computing fee…');
+  await preTx.completeFeeChangeToLock(signer, lock, 2000);
+
+  // ── 10. TypeID = hash(input[0], outputIndex=0) ───────────────────────────
+  const typeIdArgs = ccc.hashTypeId(preTx.inputs[0], 0);
+  const finalTypeScript = ccc.Script.from({
+    codeHash: contract.codeHash,
+    hashType:  'data1',
+    args:      typeIdArgs,
+  });
+
+  // Rebuild with real TypeID
+  const tx = ccc.Transaction.from({
+    version:     preTx.version,
+    cellDeps:    preTx.cellDeps,
+    headerDeps:  preTx.headerDeps,
+    inputs:      preTx.inputs,
+    outputs: [{
+      capacity: preTx.outputs[0].capacity,
+      lock,
+      type: finalTypeScript,
+    }, ...preTx.outputs.slice(1)],
+    outputsData: preTx.outputsData,
+    witnesses:   preTx.witnesses,
+  });
+
+  log(70, 'Sending to JoyID for signature…');
+
+  // ── 11. Sign + send ───────────────────────────────────────────────────────
   const txHash = await signer.sendTransaction(tx);
-
   log(100, `Confirmed! TX: ${txHash}`);
-
-  // Extract TypeID from output[0] type args
-  const typeId = tx.outputs[0]?.type?.args ?? null;
-  const capacityCkb = Number(tx.outputs[0]?.capacity ?? 0n) / 1e8;
 
   return {
     txHash,
-    typeId,
-    capacityCkb,
+    typeId:      typeIdArgs,
+    capacityCkb: Number(cellCapacity) / 1e8,
   };
 }
 
 /**
- * Estimate capacity cost for a CKBFS V3 cell (for cost panel display).
- * @param {object} opts
- * @param {number}  opts.contentBytes    - Total file size in bytes
- * @param {number}  opts.lockArgsBytes   - Lock args length in bytes (default: 22 for JoyID)
- * @returns {number} Estimated CKB needed
+ * Estimate CKB needed for a CKBFS V3 upload (for cost panel).
  */
 export function estimateCKBFSCost({ contentBytes, lockArgsBytes = 22 }) {
-  // V3 outputData is smaller than V2 (no witness indexes, just index+checksum+contentType+filename)
-  // Rough estimate: 32 (molecule header) + 8 (index+checksum) + contentType + filename
-  const outputDataBytes = 60; // conservative estimate for typical files
-  const typeSize = 65; // 32 code_hash + 1 hashType + 32 args
-  const lockSize = 32 + 1 + lockArgsBytes;
-  const capacityBytes = 8;
-  const cellBytes = capacityBytes + lockSize + typeSize + outputDataBytes;
+  const outputDataBytes = 60; // typical V3 cell data
+  const typeSize   = 65;      // 32 + 1 + 32
+  const lockSize   = 32 + 1 + lockArgsBytes;
+  const cellBytes  = 8 + lockSize + typeSize + outputDataBytes;
   const chunkCount = Math.max(1, Math.ceil(contentBytes / CHUNK_SIZE));
-  // Witness fee: chunks × (CHUNK_SIZE + 6 byte header) at 2000 shannons/KB
-  const witnessFeeShannons = BigInt(chunkCount) * BigInt(CHUNK_SIZE + 6) * 2000n / 1000n;
-  const capacityCkb = cellBytes + 2; // +2 CKB headroom
-  const feeCkb = Number(witnessFeeShannons) / 1e8;
-  return capacityCkb + feeCkb;
+  const witnessFee = chunkCount * (CHUNK_SIZE + 50) * 2000 / 1000; // shannons
+  return cellBytes + 2 + witnessFee / 1e8;
 }

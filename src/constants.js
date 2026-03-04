@@ -70,3 +70,19 @@ export const CHUNK_SIZE = 30 * 1024; // 30KB
 // version = 0x00 for V2 (confirmed from real tx witness[1][5] = 0x00)
 export const MAGIC   = new Uint8Array([0x43, 0x4b, 0x42, 0x46, 0x53]); // "CKBFS"
 export const VERSION = 0x00; // V2 wire format
+
+// ── V3 Contract (deployed 20250821) ──────────────────────────────────────────
+export const CONTRACT_V3 = {
+  mainnet: {
+    codeHash: '0xb5d13ffe0547c78021c01fe24dce2e959a1ed8edbca3cb93dd2e9f57fb56d695',
+    txHash:   '0x03deba7f8206c81981d6f6a2d61b67dde75b4df91cbcfaf2e2fb041ba50c4719',
+    index:    '0x0',
+    depType:  'depGroup',
+  },
+  testnet: {
+    codeHash: '0xb5d13ffe0547c78021c01fe24dce2e959a1ed8edbca3cb93dd2e9f57fb56d695',
+    txHash:   '0x47cfa8d554cccffe7796f93b58437269de1f98f029d0a52b6b146381f3e95e61',
+    index:    '0x0',
+    depType:  'depGroup',
+  },
+};
