@@ -108,15 +108,9 @@ export async function publishCKBFS({
     inputs:      [],
     outputs: [
       // Output[0]: CKBFS index cell — TypeID filled after input collection
+      // capacity=0x0 tells CCC to auto-calculate from occupiedSize + outputData.length
       {
-        // Compute exact capacity from actual output data size + lock args length
-        capacity: (() => {
-          const hexData = ccc.hexFrom(outputData);
-          const lockArgs = lockScript.args ? (lockScript.args.length - 2) / 2 : 20;
-          const cap = computeIndexCellCapacity(hexData, lockArgs);
-          log(16, `[DBG] outputData=${outputData.length}B hexData=${hexData.length}chars lockArgs=${lockArgs}B cap=${Number(cap)/1e8}CKB`);
-          return ccc.numToHex(cap);
-        })(),
+        capacity: '0x0',
         lock: lockScript,
         type: {
           codeHash: CKBFS_CODE_HASH,
@@ -189,7 +183,7 @@ export async function publishCKBFS({
     txHash,
     typeId,
     uri:         `ckbfs://${typeId}`,
-    capacityCkb: Number(computeIndexCellCapacity(ccc.hexFrom(outputData), lockScript.args ? (lockScript.args.length - 2) / 2 : 20) / BYTES_PER_SHANNON),
+    capacityCkb: Number(tx.outputs[0].capacity) / 1e8, // actual capacity set by CCC auto-calc
   };
 }
 
