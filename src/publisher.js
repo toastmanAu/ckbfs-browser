@@ -4,22 +4,16 @@
  * Uses CCC for transaction construction and any CCC signer for signing.
  * No Node.js. No server. Works in Chrome, Firefox, Safari (iOS included).
  *
- * Flow:
- *   1. Split file into 30KB chunks
- *   2. Build CKB transaction:
- *      - Output[0]: CKBFS index cell (225 CKB, type=CKBFS, data=molecule metadata)
- *      - Output[1]: change cell (remainder)
- *      - Witnesses[1+]: CKBFS content witnesses (one per chunk)
- *   3. Complete fees via CCC (handles input collection automatically)
- *   4. Sign + send via signer
- *   5. Return { txHash, typeId, uri }
+ * Note: This package does NOT import @ckb-ccc/core directly — instead it
+ * accepts the signer object (which comes from the host app's CCC instance)
+ * and builds the raw transaction using only browser-native APIs + CKB RPC.
+ * This avoids peer dep bundling issues and keeps the package truly universal.
  */
 
-import { ccc } from '@ckb-ccc/core';
 import {
   CKBFS_CODE_HASH, CKBFS_CELL_CAPACITY, CHUNK_SIZE, CONTRACT
 } from './constants.js';
-import { encodeCKBFSData, encodeCKBFSWitness, crc32 } from './molecule.js';
+import { encodeCKBFSData, encodeCKBFSWitness } from './molecule.js';
 
 const BYTES_PER_SHANNON = 100_000_000n;
 
@@ -28,6 +22,7 @@ const BYTES_PER_SHANNON = 100_000_000n;
  *
  * @param {object}   opts
  * @param {object}   opts.signer       - CCC signer (JoyID, MetaMask, private key, etc.)
+ * @param {object}   opts.ccc          - the @ckb-ccc/core module (passed from host app)
  * @param {Uint8Array} opts.content    - raw file bytes
  * @param {string}   opts.contentType  - MIME type, e.g. 'image/jpeg'
  * @param {string}   opts.filename     - filename, e.g. 'art.jpg'
@@ -38,6 +33,7 @@ const BYTES_PER_SHANNON = 100_000_000n;
  */
 export async function publishCKBFS({
   signer,
+  ccc,
   content,
   contentType,
   filename,
@@ -45,6 +41,7 @@ export async function publishCKBFS({
   onProgress = () => {},
 }) {
   if (!signer) throw new Error('publishCKBFS: signer is required');
+  if (!ccc)    throw new Error('publishCKBFS: ccc module is required — pass import * as ccc from "@ckb-ccc/core"');
   if (!(content instanceof Uint8Array)) throw new Error('publishCKBFS: content must be Uint8Array');
 
   const network = mainnet ? 'mainnet' : 'testnet';
@@ -62,8 +59,7 @@ export async function publishCKBFS({
   log(5, `Split into ${chunks.length} chunk${chunks.length > 1 ? 's' : ''}`);
 
   // ── 2. Encode cell output_data ─────────────────────────────────────────────
-  // Witness layout: [0]=lock witness, [1..N]=content chunks
-  // So witness indexes for content chunks are 1, 2, 3, ...
+  // witnesses[0] = lock witness, witnesses[1+] = content chunks
   const witnessIndexes = chunks.map((_, i) => i + 1);
 
   const outputData = encodeCKBFSData({
@@ -79,13 +75,12 @@ export async function publishCKBFS({
   const addresses = await signer.getAddresses();
   const changeAddr = addresses[0];
 
-  // ── 4. Build transaction via CCC ───────────────────────────────────────────
+  // ── 4. Build CCC transaction ───────────────────────────────────────────────
   log(15, 'Building transaction…');
 
   const tx = ccc.Transaction.from({
     version: '0x0',
     cellDeps: [
-      // CKBFS contract
       {
         outPoint: {
           txHash: CONTRACT[network].txHash,
@@ -94,20 +89,20 @@ export async function publishCKBFS({
         depType: CONTRACT[network].depType,
       },
     ],
-    headerDeps: [],
-    inputs:  [],   // CCC completeFeeBy fills these
+    headerDeps:  [],
+    inputs:      [],
     outputs: [
-      // Output[0]: CKBFS index cell
+      // Output[0]: CKBFS index cell — TypeID filled after input collection
       {
         capacity: ccc.numToHex(CKBFS_CELL_CAPACITY),
-        lock: changeAddr.script,  // owned by signer
+        lock: changeAddr.script,
         type: {
           codeHash: CKBFS_CODE_HASH,
           hashType: 'data1',
-          args:     '0x' + '00'.repeat(32), // TypeID filled after input collection
+          args:     '0x' + '00'.repeat(32),
         },
       },
-      // Output[1]: change (CCC fills capacity)
+      // Output[1]: change
       {
         capacity: '0x0',
         lock: changeAddr.script,
@@ -118,46 +113,37 @@ export async function publishCKBFS({
       ccc.bytesFrom(outputData),
       '0x',
     ],
-    witnesses: [], // filled below
+    witnesses: [],
   });
 
-  // ── 5. Add content witnesses ───────────────────────────────────────────────
-  // witnesses[0] = lock witness placeholder (CCC fills on sign)
-  // witnesses[1..N] = CKBFS content chunks
-  tx.witnesses.push('0x'); // placeholder for lock witness
+  // ── 5. Content witnesses ───────────────────────────────────────────────────
+  tx.witnesses.push('0x'); // slot 0 = lock witness (CCC fills on sign)
 
   log(20, 'Encoding content witnesses…');
   for (let i = 0; i < chunks.length; i++) {
-    const witness = encodeCKBFSWitness(chunks[i]);
-    tx.witnesses.push(ccc.bytesFrom(witness));
+    const w = encodeCKBFSWitness(chunks[i]);
+    tx.witnesses.push(ccc.bytesFrom(w));
     log(20 + Math.round((i / chunks.length) * 30), `Chunk ${i + 1}/${chunks.length}…`);
   }
 
-  // ── 6. Collect inputs + complete fees ─────────────────────────────────────
+  // ── 6. Collect inputs + fees ───────────────────────────────────────────────
   log(50, 'Collecting inputs…');
   await tx.addCellDepsOfKnownScripts(signer.client);
   await tx.completeInputsByCapacity(signer);
-  await tx.completeFeeBy(signer, 1000n); // 1000 shannons/KB fee rate
+  await tx.completeFeeBy(signer, 1000n);
 
-  // ── 7. Derive TypeID from first input ─────────────────────────────────────
-  // TypeID = CCC hashTypeId(firstInputOutPoint, outputIndex=0)
-  const firstInput = tx.inputs[0];
-  const typeId = ccc.hashTypeId(firstInput.previousOutput, 0);
-
-  // Patch the type args
+  // ── 7. Derive TypeID ──────────────────────────────────────────────────────
+  const typeId = ccc.hashTypeId(tx.inputs[0].previousOutput, 0);
   tx.outputs[0].type.args = typeId;
 
-  log(70, `TypeID: ${typeId.slice(0,18)}…`);
+  log(70, `TypeID: ${typeId.slice(0, 18)}…`);
 
   // ── 8. Sign + send ─────────────────────────────────────────────────────────
-  log(80, 'Waiting for signature…');
+  log(80, 'Waiting for wallet signature…');
   const txHash = await signer.sendTransaction(tx);
 
-  log(95, `Broadcast: ${txHash.slice(0,18)}… — waiting for confirmation…`);
-
-  // ── 9. Wait for confirmation ───────────────────────────────────────────────
+  log(95, `Broadcast: ${txHash.slice(0, 18)}… — waiting for confirmation…`);
   await waitConfirmed(txHash, signer.client, (msg) => log(97, msg));
-
   log(100, 'Confirmed on-chain ✅');
 
   return {
@@ -168,25 +154,16 @@ export async function publishCKBFS({
   };
 }
 
-// ── Estimate cost ─────────────────────────────────────────────────────────────
-
-/**
- * Estimate cost of publishing a file to CKBFS.
- * Does NOT require a signer — safe to call for UI display.
- */
 export function estimateCKBFSCost(contentBytes) {
   const chunks = Math.max(1, Math.ceil(contentBytes / CHUNK_SIZE));
-  const txFeeCkb = 0.01 + chunks * 0.001; // rough estimate
   return {
     indexCellCkb: Number(CKBFS_CELL_CAPACITY / 100_000_000n),
-    txFeeCkb:     parseFloat(txFeeCkb.toFixed(4)),
-    totalCkb:     Number(CKBFS_CELL_CAPACITY / 100_000_000n) + parseFloat(txFeeCkb.toFixed(4)),
+    txFeeCkb:     parseFloat((0.01 + chunks * 0.001).toFixed(4)),
+    totalCkb:     Number(CKBFS_CELL_CAPACITY / 100_000_000n) + parseFloat((0.01 + chunks * 0.001).toFixed(4)),
     chunks,
-    note: 'Index cell (225 CKB) is locked permanently. File bytes live in prunable witnesses.',
+    note: 'Index cell (225 CKB) locked permanently. File bytes in prunable witnesses.',
   };
 }
-
-// ── Wait for confirmation ─────────────────────────────────────────────────────
 
 async function waitConfirmed(txHash, client, onMsg, maxMs = 120_000) {
   const start = Date.now();
@@ -200,10 +177,7 @@ async function waitConfirmed(txHash, client, onMsg, maxMs = 120_000) {
     } catch (e) {
       if (e.message.includes('rejected')) throw e;
     }
-    await sleep(6000);
+    await new Promise(r => setTimeout(r, 6000));
   }
-  // Don't throw — tx may still confirm, caller can poll themselves
-  onMsg('Timed out waiting for confirmation — tx may still confirm');
+  onMsg('Timed out — tx may still confirm');
 }
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
