@@ -71,14 +71,10 @@ export async function publishCKBFS({
 
   log(10, 'Encoded metadata…');
 
-  // ── 3. Get signer address + lock script ───────────────────────────────────
-  const addrStrings = await signer.getAddresses();
-  const addrStr = addrStrings[0];
-  if (!addrStr) throw new Error('publishCKBFS: signer returned no addresses');
-
-  // Parse address string → Address object to get the lock script
-  const changeAddr = await ccc.Address.fromString(addrStr, signer.client);
-  const lockScript = changeAddr.script;
+  // ── 3. Get signer lock script ──────────────────────────────────────────────
+  // getAddressObjs() returns Address objects with .script — unlike getAddresses() which returns strings
+  const addrObj = await signer.getRecommendedAddressObj();
+  const lockScript = addrObj.script;
 
   // ── 4. Build CCC transaction ───────────────────────────────────────────────
   log(15, 'Building transaction…');
@@ -138,6 +134,9 @@ export async function publishCKBFS({
   await tx.completeFeeBy(signer, 1000n);
 
   // ── 7. Derive TypeID ──────────────────────────────────────────────────────
+  if (!tx.inputs[0]?.previousOutput) {
+    throw new Error('No inputs collected — wallet may have insufficient CKB (need 225+ CKB for CKBFS index cell)');
+  }
   const typeId = ccc.hashTypeId(tx.inputs[0].previousOutput, 0);
   tx.outputs[0].type.args = typeId;
 
