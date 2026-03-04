@@ -1,216 +1,112 @@
 /**
- * publisher.js — Browser-native CKBFS V2 transaction builder + sender
+ * publisher.js — CKBFS V3 publisher using the official @ckbfs/api SDK
  *
- * Uses CCC for transaction construction and any CCC signer for signing.
- * No Node.js. No server. Works in Chrome, Firefox, Safari (iOS included).
- *
- * Note: This package does NOT import @ckb-ccc/core directly — instead it
- * accepts the signer object (which comes from the host app's CCC instance)
- * and builds the raw transaction using only browser-native APIs + CKB RPC.
- * This avoids peer dep bundling issues and keeps the package truly universal.
+ * Delegates to @ckbfs/api's createPublishV3Transaction for correct tx construction.
+ * The host app must have @ckbfs/api installed as a peer dependency.
  */
 
-import {
-  CKBFS_CODE_HASH, CKBFS_CELL_CAPACITY, CHUNK_SIZE, CONTRACT
-} from './constants.js';
-import { encodeCKBFSData, encodeCKBFSWitness } from './molecule.js';
+import { CHUNK_SIZE } from './constants.js';
 
 const BYTES_PER_SHANNON = 100_000_000n;
 
 /**
- * Compute the minimum cell capacity for a CKBFS index cell (in shannons).
- * capacity(8) + lock(32+1+lockArgs) + type(32+1+32) + data(dataBytes)
- * Add 2 CKB headroom to ensure CCC's completeFeeBy doesn't need extra inputs.
- */
-function computeIndexCellCapacity(outputData, lockArgsBytes = 20) {
-  const lockSize = 32 + 1 + lockArgsBytes; // code_hash + hash_type + args
-  const typeSize = 32 + 1 + 32;            // code_hash + hash_type + TypeID args
-  const dataLen  = Math.ceil(outputData.length / 2); // hex string → bytes
-  const minBytes = 8 + lockSize + typeSize + dataLen;
-  const headroom = 200000000n; // 2 CKB headroom
-  return BigInt(minBytes) * 100000000n + headroom;
-}
-
-/**
- * Publish a file to CKBFS V2 using any CCC signer.
+ * Publish a file to CKBFS V3.
  *
- * @param {object}   opts
- * @param {object}   opts.signer       - CCC signer (JoyID, MetaMask, private key, etc.)
- * @param {object}   opts.ccc          - the @ckb-ccc/core module (passed from host app)
- * @param {Uint8Array} opts.content    - raw file bytes
- * @param {string}   opts.contentType  - MIME type, e.g. 'image/jpeg'
- * @param {string}   opts.filename     - filename, e.g. 'art.jpg'
- * @param {boolean}  [opts.mainnet]    - default false (testnet)
- * @param {function} [opts.onProgress] - (pct: number, msg: string) => void
+ * @param {object} opts
+ * @param {Uint8Array}  opts.content       - Raw file bytes
+ * @param {string}      opts.contentType   - MIME type
+ * @param {string}      opts.filename      - Filename for the CKBFS cell
+ * @param {object}      opts.signer        - CCC signer (JoyID, MetaMask, etc.)
+ * @param {object}      opts.ccc           - import * as ccc from '@ckb-ccc/core'
+ * @param {object}      opts.ckbfs         - import * as ckbfs from '@ckbfs/api'
+ * @param {boolean}     opts.mainnet       - true = CKB mainnet, false = testnet
+ * @param {Function}    opts.onProgress    - (pct: number, msg: string) => void
  *
- * @returns {Promise<{ txHash: string, typeId: string, uri: string, capacityCkb: number }>}
+ * @returns {Promise<{txHash: string, typeId: string, capacityCkb: number}>}
  */
 export async function publishCKBFS({
-  signer,
-  ccc,
   content,
   contentType,
   filename,
+  signer,
+  ccc,
+  ckbfs,
   mainnet = false,
   onProgress = () => {},
 }) {
   if (!signer) throw new Error('publishCKBFS: signer is required');
-  if (!ccc)    throw new Error('publishCKBFS: ccc module is required — pass import * as ccc from "@ckb-ccc/core"');
+  if (!ccc)    throw new Error('publishCKBFS: ccc module is required');
+  if (!ckbfs)  throw new Error('publishCKBFS: ckbfs module is required — pass import * as ckbfs from "@ckbfs/api"');
   if (!(content instanceof Uint8Array)) throw new Error('publishCKBFS: content must be Uint8Array');
 
   const network = mainnet ? 'mainnet' : 'testnet';
   const log = (pct, msg) => { onProgress(pct, msg); console.log(`[ckbfs] ${msg}`); };
 
-  log(0, `Preparing ${filename || 'file'} (${(content.length / 1024).toFixed(1)} KB) for CKBFS…`);
+  log(0, `Preparing ${filename || 'file'} (${(content.length / 1024).toFixed(1)} KB) for CKBFS V3…`);
 
   // ── 1. Split into chunks ───────────────────────────────────────────────────
-  const chunks = [];
+  const contentChunks = [];
   for (let i = 0; i < content.length; i += CHUNK_SIZE) {
-    chunks.push(content.slice(i, i + CHUNK_SIZE));
+    contentChunks.push(content.slice(i, i + CHUNK_SIZE));
   }
-  if (chunks.length === 0) chunks.push(new Uint8Array(0));
+  if (contentChunks.length === 0) contentChunks.push(new Uint8Array(0));
 
-  log(5, `Split into ${chunks.length} chunk${chunks.length > 1 ? 's' : ''}`);
+  log(5, `Split into ${contentChunks.length} chunk${contentChunks.length > 1 ? 's' : ''}`);
 
-  // ── 2. Encode cell output_data ─────────────────────────────────────────────
-  // witnesses[0] = lock witness, witnesses[1+] = content chunks
-  const witnessIndexes = chunks.map((_, i) => i + 1);
-
-  const outputData = encodeCKBFSData({
-    witnessIndexes,
-    fileBytes:   content,
-    contentType: contentType || 'application/octet-stream',
-    filename:    filename    || 'file',
-  });
-
-  log(10, `Encoded metadata — outputData.length=${outputData.length} bytes, content.length=${content.length} bytes`);
-
-  // ── 3. Get signer lock script ──────────────────────────────────────────────
-  // getAddressObjs() returns Address objects with .script — unlike getAddresses() which returns strings
+  // ── 2. Get signer lock script ──────────────────────────────────────────────
   const addrObj = await signer.getRecommendedAddressObj();
-  const lockScript = addrObj.script;
+  const lock = addrObj.script;
 
-  // ── 4. Build CCC transaction ───────────────────────────────────────────────
-  log(15, 'Building transaction…');
+  log(15, 'Building V3 transaction via @ckbfs/api…');
 
-  const tx = ccc.Transaction.from({
-    version: '0x0',
-    cellDeps: [
-      {
-        outPoint: {
-          txHash: CONTRACT[network].txHash,
-          index:  CONTRACT[network].index,
-        },
-        depType: CONTRACT[network].depType,
-      },
-    ],
-    headerDeps:  [],
-    inputs:      [],
-    outputs: [
-      // Output[0]: CKBFS index cell — TypeID filled after input collection
-      // capacity=0x0 tells CCC to auto-calculate from occupiedSize + outputData.length
-      {
-        capacity: '0x0',
-        lock: lockScript,
-        type: {
-          codeHash: CKBFS_CODE_HASH,
-          hashType: 'data1',
-          args:     '0x' + '00'.repeat(32),
-        },
-      },
-      // Output[1]: change
-      {
-        capacity: '0x0',
-        lock: lockScript,
-        type: null,
-      },
-    ],
-    outputsData: [
-      ccc.hexFrom(outputData),
-      '0x',
-    ],
-    witnesses: [],
+  // ── 3. Build tx using official SDK ────────────────────────────────────────
+  const tx = await ckbfs.createPublishV3Transaction(signer, {
+    contentChunks,
+    contentType: contentType || 'application/octet-stream',
+    filename: filename || 'file',
+    lock,
+    network,
+    useTypeID: false,
+    feeRate: 2000,
   });
 
-  // ── 5. Content witnesses ───────────────────────────────────────────────────
-  tx.witnesses.push('0x'); // slot 0 = lock witness (CCC fills on sign)
+  log(85, 'Transaction built — sending to JoyID for signature…');
 
-  log(20, 'Encoding content witnesses…');
-  for (let i = 0; i < chunks.length; i++) {
-    const w = encodeCKBFSWitness(chunks[i]);
-    tx.witnesses.push(ccc.hexFrom(w));  // hex string — Uint8Array breaks JoyID serialisation
-    log(20 + Math.round((i / chunks.length) * 30), `Chunk ${i + 1}/${chunks.length}…`);
-  }
-
-  // ── 6. Collect inputs + fees ───────────────────────────────────────────────
-  log(50, 'Collecting inputs…');
-  await tx.addCellDepsOfKnownScripts(signer.client);
-  const witnessFeeReserve = BigInt(chunks.length) * 100000n;
-  log(51, `[DBG] outputs capacity: ${tx.getOutputsCapacity()} shannons (${Number(tx.getOutputsCapacity())/1e8} CKB)`);
-  log(52, `[DBG] output[0] capacity: ${tx.outputs[0]?.capacity} shannons`);
-  log(53, `[DBG] output[1] capacity: ${tx.outputs[1]?.capacity} shannons`);
-  log(54, `[DBG] witnessFeeReserve: ${witnessFeeReserve} shannons`);
-  await tx.completeInputsByCapacity(signer, witnessFeeReserve);
-  await tx.completeFeeBy(signer, 3000n);
-
-  // ── 7. Derive TypeID ──────────────────────────────────────────────────────
-  if (!tx.inputs[0]) {
-    throw new Error('No inputs collected — wallet may have insufficient CKB (need 225+ CKB for CKBFS index cell)');
-  }
-  // hashTypeId takes the full CellInput object, NOT just previousOutput
-  const typeId = ccc.hashTypeId(tx.inputs[0], 0);
-  tx.outputs[0].type.args = typeId;
-
-  log(70, `TypeID: ${typeId.slice(0, 18)}…`);
-
-  // ── 8. Sign + send ─────────────────────────────────────────────────────────
-  log(80, 'Waiting for wallet signature…');
-  // Log full tx summary before handing to JoyID
-  log(81, `[DBG] tx summary — inputs:${tx.inputs.length} outputs:${tx.outputs.length} witnesses:${tx.witnesses.length} totalOutputCap:${tx.getOutputsCapacity()} shannons`);
-  console.log('[ckbfs-publisher] tx before sign:', JSON.stringify({
-    inputs:  tx.inputs.length,
-    outputs: tx.outputs.map(o => ({ cap: o.capacity?.toString(), type: o.type?.codeHash?.slice(0,10) })),
-    witnesses: tx.witnesses.map(w => (typeof w === 'string' ? w.length : '?') + ' chars'),
-    cellDeps: tx.cellDeps.map(d => ({ txHash: d.outPoint?.txHash?.slice(0,10), depType: d.depType })),
-  }, null, 2));
+  // ── 4. Sign + send ────────────────────────────────────────────────────────
   const txHash = await signer.sendTransaction(tx);
 
-  log(95, `Broadcast: ${txHash.slice(0, 18)}… — waiting for confirmation…`);
-  await waitConfirmed(txHash, signer.client, (msg) => log(97, msg));
-  log(100, 'Confirmed on-chain ✅');
+  log(100, `Confirmed! TX: ${txHash}`);
+
+  // Extract TypeID from output[0] type args
+  const typeId = tx.outputs[0]?.type?.args ?? null;
+  const capacityCkb = Number(tx.outputs[0]?.capacity ?? 0n) / 1e8;
 
   return {
     txHash,
     typeId,
-    uri:         `ckbfs://${typeId}`,
-    capacityCkb: Number(tx.outputs[0].capacity) / 1e8, // actual capacity set by CCC auto-calc
+    capacityCkb,
   };
 }
 
-export function estimateCKBFSCost(contentBytes) {
-  const chunks = Math.max(1, Math.ceil(contentBytes / CHUNK_SIZE));
-  return {
-    indexCellCkb: Number(CKBFS_CELL_CAPACITY / 100_000_000n),
-    txFeeCkb:     parseFloat((0.01 + chunks * 0.001).toFixed(4)),
-    totalCkb:     Number(CKBFS_CELL_CAPACITY / 100_000_000n) + parseFloat((0.01 + chunks * 0.001).toFixed(4)),
-    chunks,
-    note: 'Index cell capacity locked permanently (size varies ~150–225 CKB based on file metadata). File bytes in prunable witnesses.',
-  };
-}
-
-async function waitConfirmed(txHash, client, onMsg, maxMs = 120_000) {
-  const start = Date.now();
-  while (Date.now() - start < maxMs) {
-    try {
-      const tx = await client.getTransaction(txHash);
-      const status = tx?.status;
-      if (status === 'committed') return;
-      if (status === 'rejected') throw new Error(`Transaction rejected: ${txHash}`);
-      onMsg(`Waiting… status: ${status || 'pending'}`);
-    } catch (e) {
-      if (e.message.includes('rejected')) throw e;
-    }
-    await new Promise(r => setTimeout(r, 6000));
-  }
-  onMsg('Timed out — tx may still confirm');
+/**
+ * Estimate capacity cost for a CKBFS V3 cell (for cost panel display).
+ * @param {object} opts
+ * @param {number}  opts.contentBytes    - Total file size in bytes
+ * @param {number}  opts.lockArgsBytes   - Lock args length in bytes (default: 22 for JoyID)
+ * @returns {number} Estimated CKB needed
+ */
+export function estimateCKBFSCost({ contentBytes, lockArgsBytes = 22 }) {
+  // V3 outputData is smaller than V2 (no witness indexes, just index+checksum+contentType+filename)
+  // Rough estimate: 32 (molecule header) + 8 (index+checksum) + contentType + filename
+  const outputDataBytes = 60; // conservative estimate for typical files
+  const typeSize = 65; // 32 code_hash + 1 hashType + 32 args
+  const lockSize = 32 + 1 + lockArgsBytes;
+  const capacityBytes = 8;
+  const cellBytes = capacityBytes + lockSize + typeSize + outputDataBytes;
+  const chunkCount = Math.max(1, Math.ceil(contentBytes / CHUNK_SIZE));
+  // Witness fee: chunks × (CHUNK_SIZE + 6 byte header) at 2000 shannons/KB
+  const witnessFeeShannons = BigInt(chunkCount) * BigInt(CHUNK_SIZE + 6) * 2000n / 1000n;
+  const capacityCkb = cellBytes + 2; // +2 CKB headroom
+  const feeCkb = Number(witnessFeeShannons) / 1e8;
+  return capacityCkb + feeCkb;
 }
