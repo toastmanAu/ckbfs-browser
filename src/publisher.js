@@ -111,7 +111,7 @@ export async function publishCKBFS({
       },
     ],
     outputsData: [
-      ccc.bytesFrom(outputData),
+      ccc.hexFrom(outputData),
       '0x',
     ],
     witnesses: [],
@@ -123,7 +123,7 @@ export async function publishCKBFS({
   log(20, 'Encoding content witnesses…');
   for (let i = 0; i < chunks.length; i++) {
     const w = encodeCKBFSWitness(chunks[i]);
-    tx.witnesses.push(ccc.bytesFrom(w));
+    tx.witnesses.push(ccc.hexFrom(w));  // hex string — Uint8Array breaks JoyID serialisation
     log(20 + Math.round((i / chunks.length) * 30), `Chunk ${i + 1}/${chunks.length}…`);
   }
 
