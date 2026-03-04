@@ -130,12 +130,13 @@ export async function publishCKBFS({
   // ── 6. Collect inputs + fees ───────────────────────────────────────────────
   log(50, 'Collecting inputs…');
   await tx.addCellDepsOfKnownScripts(signer.client);
-  // Pre-reserve ~500K shannons (0.005 CKB) for witness fees before collecting inputs.
-  // CKBFS witnesses can be 30KB+ per chunk — at 3000 shannons/KB that's 90K+ per chunk.
-  // Without this, completeFeeBy may fail because change is already at minimum.
-  const witnessFeeReserve = BigInt(chunks.length) * 100000n; // ~0.001 CKB per chunk
+  const witnessFeeReserve = BigInt(chunks.length) * 100000n;
+  log(51, `[DBG] outputs capacity: ${tx.getOutputsCapacity()} shannons, fee reserve: ${witnessFeeReserve}`);
   await tx.completeInputsByCapacity(signer, witnessFeeReserve);
-  await tx.completeFeeBy(signer, 3000n); // 3000 shannons/KB
+  log(52, `[DBG] inputs collected: ${tx.inputs.length}, inputs capacity: ${await tx.getInputsCapacity(signer.client)} shannons`);
+  log(53, `[DBG] outputs[1] before fee: ${tx.outputs[1]?.capacity}`);
+  await tx.completeFeeBy(signer, 3000n);
+  log(54, `[DBG] fee complete — inputs: ${tx.inputs.length}, change: ${tx.outputs[1]?.capacity} shannons`);
 
   // ── 7. Derive TypeID ──────────────────────────────────────────────────────
   if (!tx.inputs[0]) {
@@ -149,6 +150,14 @@ export async function publishCKBFS({
 
   // ── 8. Sign + send ─────────────────────────────────────────────────────────
   log(80, 'Waiting for wallet signature…');
+  // Log full tx summary before handing to JoyID
+  log(81, `[DBG] tx summary — inputs:${tx.inputs.length} outputs:${tx.outputs.length} witnesses:${tx.witnesses.length} totalOutputCap:${tx.getOutputsCapacity()} shannons`);
+  console.log('[ckbfs-publisher] tx before sign:', JSON.stringify({
+    inputs:  tx.inputs.length,
+    outputs: tx.outputs.map(o => ({ cap: o.capacity?.toString(), type: o.type?.codeHash?.slice(0,10) })),
+    witnesses: tx.witnesses.map(w => (typeof w === 'string' ? w.length : '?') + ' chars'),
+    cellDeps: tx.cellDeps.map(d => ({ txHash: d.outPoint?.txHash?.slice(0,10), depType: d.depType })),
+  }, null, 2));
   const txHash = await signer.sendTransaction(tx);
 
   log(95, `Broadcast: ${txHash.slice(0, 18)}… — waiting for confirmation…`);
