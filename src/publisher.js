@@ -149,6 +149,10 @@ export async function publishCKBFS({
   log(50, 'Collecting inputs…');
   await tx.addCellDepsOfKnownScripts(signer.client);
   const witnessFeeReserve = BigInt(chunks.length) * 100000n;
+  log(51, `[DBG] outputs capacity: ${tx.getOutputsCapacity()} shannons (${Number(tx.getOutputsCapacity())/1e8} CKB)`);
+  log(52, `[DBG] output[0] capacity: ${tx.outputs[0]?.capacity} shannons`);
+  log(53, `[DBG] output[1] capacity: ${tx.outputs[1]?.capacity} shannons`);
+  log(54, `[DBG] witnessFeeReserve: ${witnessFeeReserve} shannons`);
   await tx.completeInputsByCapacity(signer, witnessFeeReserve);
   await tx.completeFeeBy(signer, 3000n);
 
